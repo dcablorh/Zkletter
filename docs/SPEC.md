@@ -182,15 +182,26 @@ Events are the source for indexers. No letter content or salts are ever on-chain
 Everything above. Deliberately simple and auditable.
 
 ### v2: Private verification (ZK, Groth16)
+Two proofs only:
+
 - **Circuit A (membership):** prove knowledge of `(fields_digest, salt, path)` such that
-  the leaf is in an anchored root of issuer X. Verifier learns only "valid letter from
-  X", not the leaf or `ref_no`.
-- **Circuit B (non-revocation):** prove the leaf is not in the revocation tree (revocation
-  becomes a Poseidon sparse Merkle tree root).
-- **Circuit C (predicates):** prove statements about fields (date range, amount >= N,
-  recipient is over 18) without revealing them.
+  the leaf is in an anchored root of issuer X. The verifier learns only "valid letter
+  from X", not the leaf or `ref_no`.
+- **Circuit B (field predicates):** extends A with statements about committed fields
+  (date within a range, amount >= N, field equals a value) without revealing them.
+  Fields are committed individually (per-field leaves under `fields_digest`) so a
+  predicate can open one field without opening the rest.
+
+Out of scope for ZK: a non-revocation proof. Revocation stays a plain on-chain
+lookup (see caveat below).
+
 - Browser proving with snarkjs WASM; on-chain check with `sui::groth16` (BN254).
 - Needs a trusted setup (reuse Powers of Tau plus a phase-2 ceremony) and an audit.
+
+Caveat: because revocation is a plain lookup keyed by leaf, a private (ZK) verification
+cannot check it without revealing the leaf. In v2 the holder therefore either (a) accepts
+a linkable revocation check, or (b) the issuer publishes a revocation root that a future
+circuit can use. Decision deferred; see open questions.
 
 ### v3: Ecosystem
 Seal-encrypted letter delivery via Walrus, zkLogin for recipients, governance for the
@@ -227,3 +238,4 @@ docs/             this spec, threat model, runbooks
 3. Registry governance model after the pilot.
 4. Whether to require `consume` semantics for specific letter types.
 5. Hosting and operator of the canonical verifier domain.
+6. How private (ZK) verification should handle revocation (see v2 caveat).
