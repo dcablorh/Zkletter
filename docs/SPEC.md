@@ -1,241 +1,170 @@
-# Zkletter: Design Spec (v0.1)
+# Zkletter: Design Spec (v0.2, ZK-first)
 
-Verifiable official letters for institutions, built on Sui. Anyone can check that a
-letter is authentic and came from the expected institution, without the letter's
-content ever being published.
+Institutions issue official letters; holders prove in zero knowledge that a letter is
+genuine and un-revoked; Sui verifies the proof. Superseded: v0.1 (anchored provenance
+with non-ZK verification) was dropped because the project's purpose is to show ZK at work.
 
 ## 1. Problem
 
-Forged notices and letters circulate because a reader cannot tell (a) who really
-issued a document or (b) whether it was altered. A QR code or logo on paper proves
-nothing: it can be copied onto a fake letter.
+Forged notices circulate because nobody can tell who issued a document or whether it was
+altered. A QR code or logo can be copied onto a fake.
 
 ## 2. Goals and non-goals
 
 Goals
-- A verifier can confirm: *this exact content was issued by institution X, on date Y,
-  and has not been revoked.*
-- Content stays private. Only commitments are published on-chain.
-- A QR code copied onto a different letter must fail verification.
-- Institutions can issue at volume cheaply (batched anchoring).
-- Works from paper with a phone camera, no wallet needed by the verifier.
+- Verification is a ZK proof checked by `sui::groth16`. No verification path reveals the
+  letter or which letter it is.
+- A QR copied onto a different letter cannot produce a valid proof.
+- Revocation is respected inside the proof.
+- Field predicates (date range, threshold, equality) can be proven without revealing the
+  field.
+- Institutions issue in batches; only roots go on-chain.
+- The app teaches: it shows private vs public inputs, proof size and the on-chain check.
 
-Non-goals (v1)
-- Proving an institution is legitimate beyond the curated registry (trust anchor is
-  governance plus domain proof; see 4.1).
-- Preventing a faithful copy of a genuine letter from being shown by the wrong person
-  (mitigated, see 8).
-- Hiding *which* letter is being checked from the public verifier (v2, ZK).
+Non-goals
+- Judging whether an institution is legitimate beyond the curated registry.
+- Stopping a genuine letter's rightful holder from proving it (that is the feature).
+- Production-grade trusted setup (the demo uses a dev ceremony).
 
-## 3. Core idea
+## 3. Actors
 
-> The QR carries the secret needed to **recompute** a commitment. The verifier supplies
-> the letter's content. Authenticity = recomputed commitment is in a Merkle tree the
-> institution anchored on Sui.
-
-A copied QR fails because the fake letter's content produces a different commitment.
-
-## 4. Actors and components
-
-| Component | Responsibility |
+| Actor | Role |
 |---|---|
-| Registry admin (multisig) | Approves institutions, can suspend them |
-| Institution | Issues letters, anchors batches, revokes |
-| Holder / recipient | Holds the letter (paper or PDF) |
-| Verifier | Scans QR, supplies content, gets a verdict |
-| Indexer | Public service that serves Merkle paths and chain state |
-| Sui Move package | Registry, anchoring, revocation, (v2) proof verification |
+| Registry admin (multisig) | Approves, suspends, reinstates institutions |
+| Institution | Issues letters, anchors batches, updates status roots |
+| Holder | Has the letter and QR; generates proofs in the browser |
+| Verifier | Receives a proof link; checks it on Sui |
+| Indexer | Serves Merkle paths; untrusted, everything is checked against Sui |
 
-### 4.1 Institution trust anchor
+Institution trust anchor: an admin-approved `Issuer` in `IssuerRegistry` plus a domain
+proof (DNS TXT `zkletter-issuer=<id>` and `/.well-known/zkletter.json`). The verifier
+app always displays the issuer's registered name and domain.
 
-An institution is trusted only if **both** hold:
-1. It has an `Issuer` entry approved by the admin multisig in `IssuerRegistry`.
-2. It proves control of its domain: DNS TXT `zkletter-issuer=<issuer object id>` and
-   `https://<domain>/.well-known/zkletter.json` listing the same id. Admin checks this
-   at approval; the verifier app re-checks it when showing the result.
+## 4. Data model
 
-The verifier always displays the issuer's registered name and domain. Users are taught
-to trust the verifier result, never the paper.
+### 4.1 Field encoding
+A template defines up to 8 ordered field slots. Each value becomes a BN254 field element:
+- integers and dates (as `YYYYMMDD`): the integer itself (enables range proofs),
+- text and identifiers: `SHA-256(NFC(trim(value))) mod p` (enables equality proofs),
+- unused slots: 0.
 
-### 4.2 Key management
+`fields_commit = Poseidon(f1, ..., f8)`.
 
-- `IssuerCap` (owned object) authorises management of the issuer.
-- `SignerCap`s are delegated, expiring, individually revocable capabilities for staff
-  or systems that anchor batches. No single employee holds the master key.
-- Issuer can rotate keys; all changes are events on-chain.
-
-## 5. Letter format and commitment
-
-### 5.1 Canonical record
-
-Each letter type has a **template** that defines a typed set of `fields` (ref number,
-recipient name/ID, date, title, key figures, deadline, ...). Canonicalization:
-
-1. Fields encoded as JSON, keys sorted, per RFC 8785 (JCS).
-2. Strings Unicode NFC, whitespace-trimmed and collapsed, dates ISO-8601, numbers as
-   decimal strings.
-3. `fields_digest = SHA-256(canonical_json)`.
-
-For digital letters the issuer also produces the PDF. `file_digest = SHA-256(pdf bytes)`.
-
-Rule for template authors: **everything substantive must be in the fields.** Text not
-covered by the fields is only protected in digital (file) mode.
-
-### 5.2 Commitments
-
-For each letter the issuer samples a fresh 128-bit `salt` and creates two leaves:
-
+### 4.2 Leaf
 ```
-leaf_fields = Poseidon(DOM_FIELDS, issuer_id, ref_no, fields_digest, salt)
-leaf_file   = Poseidon(DOM_FILE,   issuer_id, ref_no, file_digest,   salt)   // digital only
+leaf = Poseidon(DOM_LEAF, issuer_hi, issuer_lo, ref_field, fields_commit, salt)
 ```
+`salt` is a fresh 128-bit random value. `issuer_hi/lo` split the 32-byte issuer id into two
+128-bit field elements. `ref_field = SHA-256(ref_no) mod p`.
 
-Poseidon over BN254 is used for leaves and the tree so that v2 ZK circuits need no
-migration (Sui provides `sui::poseidon`). Digests are split into field elements.
-Domain separators (`DOM_*`) prevent cross-use of leaves.
+### 4.3 Trees (per batch, depth 20, Poseidon, `node = Poseidon(DOM_NODE, l, r)`)
+- **Letters tree:** leaves are letter leaves.
+- **Status tree:** same positions; leaf value `0` = active, `1` = revoked, `2` = consumed.
+  The issuer updates it and anchors the new status root when it revokes.
 
-### 5.3 Batching
+Zero subtrees pad both trees. Merkle paths are public data and reveal nothing without the
+salt and content.
 
-The institution accumulates leaves and periodically builds a Poseidon Merkle tree
-(depth 20, about one million letters per batch), then calls `anchor(root, count)`.
-Only the root goes on-chain. Merkle paths are published to the indexer; a path alone
-reveals nothing without the salt and content.
-
-## 6. QR payload
-
-The QR encodes a short HTTPS URL, with the secret in the fragment so it is never sent
-to any server:
-
+### 4.4 QR payload
 ```
-https://verify.zkletter.app/v1/<issuer_id>/<ref_no>#s=<salt>&k=<key_id>&m=<mode>
+https://verify.zkletter.app/v1/<issuer_id>/<ref_no>#s=<salt>&i=<index>&b=<batch_seq>
 ```
+The salt stays in the fragment and is never sent to a server.
 
-- `salt`: required to recompute the commitment.
-- Merkle path and batch are fetched from the indexer by `(issuer_id, ref_no)`.
-- A digital letter additionally embeds both leaves' metadata in the PDF.
+## 5. Circuits (circom 2, Groth16, BN254)
 
-## 7. Verification algorithm
+### 5.1 `letter_valid`
+- Private: `f[8]`, `salt`, `ref_field`, `index` bits, `letters_path[20]`, `status_path[20]`.
+- Public: `issuer_hi`, `issuer_lo`, `letters_root`, `status_root`, `context`.
+- Constraints:
+  1. `fields_commit = Poseidon(f)`.
+  2. `leaf = Poseidon(DOM_LEAF, issuer_hi, issuer_lo, ref_field, fields_commit, salt)`.
+  3. `MerkleRoot(leaf, index, letters_path) == letters_root`.
+  4. `MerkleRoot(0, index, status_path) == status_root` (status is active).
+- `context` is a verifier nonce; it is constrained (squared) so it is bound to the proof.
 
-Inputs: QR payload plus the letter content (fields from OCR/form, or the PDF file).
+### 5.2 `letter_predicates`
+`letter_valid` plus a predicate selector over named slots, with public parameters:
+- `range`: `lo <= f[k] <= hi` (circomlib `LessEqThan`, 32 bits for dates and amounts),
+- `eq`: `f[k] == public_value` (for hashed identifiers),
+- `ge`: `f[k] >= threshold`.
 
-1. Parse QR; extract `issuer_id`, `ref_no`, `salt`.
-2. Fetch `Issuer` from Sui; require status `Active`. Check the domain proof; display
-   issuer name and domain.
-3. Canonicalize the supplied content and compute the digest:
-   - **Paper mode:** user confirms OCR-extracted fields; compute `fields_digest`.
-   - **Digital mode:** hash the uploaded PDF; compute `file_digest`.
-4. Recompute the leaf with the salt.
-5. Fetch the Merkle path from the indexer; recompute the root.
-6. Check that the root is an anchored batch of this issuer on Sui.
-7. Check the leaf is not in the issuer's revocation table.
-8. Verdict:
-   - Valid: content matches an authentic record from the issuer.
-   - Invalid content: root check failed (content or QR was altered or copied).
-   - Revoked / issuer suspended / not found.
+Public outputs add the predicate parameters; the field values stay private.
 
-The verification runs in the client; the indexer is untrusted (everything it returns is
-checked against Sui).
+### 5.3 Setup
+Powers of Tau (reuse a public ptau file) plus a per-circuit phase 2 contribution. The demo
+uses a single-party dev setup, labelled as such in the UI. Production needs a multi-party
+ceremony and an audit.
+
+## 6. Sui contracts (Move)
+
+- `registry` (built): issuers, `AdminCap`, `IssuerCap`, `SignerCap` with expiry and
+  revocation, cap rotation.
+- `anchor` (to change): per `(issuer, seq)` record `{ letters_root, status_root, count,
+  anchored_at }`; `update_status_root(cap, seq, new_status_root)` for revocation. Latest
+  status root per batch is the only acceptable one for verification.
+- `revocation` (to change): replaced by status-root updates; no per-letter lookup.
+- `verifier` (new): stores the verifying keys; `verify_letter_valid(...)` and
+  `verify_predicates(...)` call `sui::groth16`, check that the issuer is active, the
+  letters root is anchored and the status root is the batch's current one, then emit
+  `LetterProofVerified { issuer_id, context, kind }`.
+
+Proof and verifying-key bytes must be converted from snarkjs JSON to the compressed
+arkworks encoding Sui expects (public inputs are 32-byte little-endian field elements).
+
+## 7. Flows
+
+**Issue.** Institution fills template, SDK builds leaf, batch trees are built, `anchor`
+records both roots, QR/PDF generated per letter.
+
+**Prove.** Holder opens the QR, supplies the letter's field values (typed or OCR and
+confirmed), the app fetches paths from the indexer, snarkjs WASM proves locally, the app
+produces a proof link: `{ kind, proof, public_inputs }`.
+
+**Verify.** The verifier page submits the proof to the `verifier` module (or simulates the
+call). On success it shows issuer name and domain, the verified predicate, and the
+transaction digest.
+
+**Revoke.** The institution flips a status leaf to `1`, recomputes the status root and calls
+`update_status_root`. Older proofs against the stale status root stop verifying.
 
 ## 8. Threat model
 
 | Threat | Result |
 |---|---|
-| QR copied onto a different letter | Fails at step 5: different content gives a different leaf |
-| Content altered after issue | Fails the same way |
-| Fake QR pointing at a look-alike institution | Fails at step 2: issuer not in registry or domain proof mismatch. Verdict always shows registered name and domain |
-| Phishing verifier page | One canonical verifier domain; ship signed/open-source client; educate users to type or scan only that domain |
-| Compromised staff member | Scoped, expiring `SignerCap`s; revoke the cap; revoke affected letters |
-| Compromised institution key | Admin can suspend the issuer; rotation flow; all past anchors remain auditable |
-| Faithful copy of a genuine letter, presented by the wrong person | Authentic content, so it verifies. Mitigations: recipient name/ID is a required field the relying party checks; expiry field; optional on-chain `consume(leaf)` for single-use documents; verifier service shows verification count |
-| Free text not covered by fields (paper mode) | Template rule in 5.1: all substantive content must be in fields; otherwise only digital mode protects it |
-| Salt leaks with the paper letter | Salt only lets someone check that exact content; it does not reveal content and cannot forge another letter |
-| Brute-forcing content from the leaf | 128-bit salt makes guessing infeasible |
-| Indexer lies or censors | Lies are detected (checked against Sui); censorship is mitigated by anyone being able to run an indexer from chain events plus issuer-published paths |
-| Registry admin abuse | Multisig, timelock on approvals, public events; governance upgrade path in v3 |
+| QR copied onto a fake letter | Prover cannot satisfy the circuit; no proof exists |
+| Altered field values | Different `fields_commit`, leaf not in tree, no proof |
+| Proof replayed to another verifier | `context` public input binds it to one verifier |
+| Proof for a revoked letter | Status leaf non-zero, no proof; stale status roots rejected on-chain |
+| Fake institution | Not in registry or domain mismatch; verdict shows registered name and domain |
+| Compromised staff key | Scoped, expiring, revocable `SignerCap`; rotate to invalidate all caps |
+| Compromised institution key | Admin suspends issuer; rotation; anchors stay auditable |
+| Indexer lies | Paths that don't hash to an anchored root fail in the circuit |
+| Faithful copy shown by a different person | Provable only by someone who knows the content and salt; bind with a recipient-id predicate and `context` |
+| Malicious trusted setup | Demo-only setup labelled; multi-party ceremony before production |
+| Phishing verifier site | Single canonical domain; the proof check is on-chain and reproducible |
 
-## 9. On-chain design (Move)
-
-Package `zkletter`:
-
-- `registry`
-  - `IssuerRegistry` (shared): `Table<ID, Issuer>`.
-  - `Issuer`: name, domain, status (`Active | Suspended`), key info.
-  - `AdminCap`; `approve_issuer`, `suspend_issuer`, `reinstate_issuer`.
-  - Admin is a multisig address.
-- `anchor`
-  - `BatchAnchor` object per batch: `issuer_id`, `root`, `count`, `timestamp`, `seq`.
-  - `anchor(&IssuerCap | &SignerCap, root, count)` emits `BatchAnchored`.
-  - Only issuers with status `Active` can anchor.
-- `revocation`
-  - `Revocations` (shared, per issuer): `Table<leaf, RevocationInfo>`.
-  - `revoke(cap, leaf, reason_code)`; `consume(cap, leaf)` for single-use.
-- `signers`
-  - `SignerCap { issuer_id, expires_at }`; `delegate`, `revoke_signer`.
-- (v2) `verifier`
-  - `sui::groth16` verification key per circuit; `verify_letter_proof(...)`.
-
-Events are the source for indexers. No letter content or salts are ever on-chain.
-
-## 10. Layered roadmap
-
-### v1: Anchored provenance (no ZK)
-Everything above. Deliberately simple and auditable.
-
-### v2: Private verification (ZK, Groth16)
-Two proofs only:
-
-- **Circuit A (membership):** prove knowledge of `(fields_digest, salt, path)` such that
-  the leaf is in an anchored root of issuer X. The verifier learns only "valid letter
-  from X", not the leaf or `ref_no`.
-- **Circuit B (field predicates):** extends A with statements about committed fields
-  (date within a range, amount >= N, field equals a value) without revealing them.
-  Fields are committed individually (per-field leaves under `fields_digest`) so a
-  predicate can open one field without opening the rest.
-
-Out of scope for ZK: a non-revocation proof. Revocation stays a plain on-chain
-lookup (see caveat below).
-
-- Browser proving with snarkjs WASM; on-chain check with `sui::groth16` (BN254).
-- Needs a trusted setup (reuse Powers of Tau plus a phase-2 ceremony) and an audit.
-
-Caveat: because revocation is a plain lookup keyed by leaf, a private (ZK) verification
-cannot check it without revealing the leaf. In v2 the holder therefore either (a) accepts
-a linkable revocation check, or (b) the issuer publishes a revocation root that a future
-circuit can use. Decision deferred; see open questions.
-
-### v3: Ecosystem
-Seal-encrypted letter delivery via Walrus, zkLogin for recipients, governance for the
-registry, multi-chain verifier SDKs.
-
-## 11. Repo layout (planned)
+## 9. Repo layout
 
 ```
-contracts/        Sui Move package (registry, anchor, revocation, signers)
-circuits/         circom circuits and ceremony notes (v2)
-packages/sdk/     canonicalization, commitments, Merkle, QR encode/decode, verify
-apps/issuer/      institution console (templates, batch issue, revoke)
-apps/verify/      public verifier (scan QR, OCR, upload PDF, verdict)
-services/indexer/ event indexer and Merkle-path API
-docs/             this spec, threat model, runbooks
+contracts/        Move: registry, anchor, verifier
+circuits/         circom: letter_valid, letter_predicates, setup scripts
+packages/sdk/     encoding, commitments, trees, witness builder, proof/VK converters
+apps/web/         issuer console, holder prover, verifier, "Under the hood" explainer
+services/indexer/ Merkle path API over Sui events
+docs/             SPEC.md, PLAN.md
 ```
 
-## 12. Milestones
+## 10. Milestones
 
-1. **M0:** spec review, fix hash/field choices, set up toolchain (Sui CLI, Node, circom).
-2. **M1:** `packages/sdk` (canonicalize, Poseidon commitments, Merkle, QR) with test
-   vectors shared by TS and Move.
-3. **M2:** Move package with unit tests; deploy to testnet.
-4. **M3:** indexer plus verifier app (paper and digital modes).
-5. **M4:** issuer console (template editor, bulk issue, QR/PDF generation, revoke).
-6. **M5:** pilot with one institution; external review of the commitment scheme and
-   contracts.
-7. **M6+:** v2 circuits, trusted setup, audit, mainnet.
+Z0 spec; Z1 SDK v2; Z2 circuits and local proofs; Z3 contracts with on-chain
+verification; Z4 apps; Z5 testnet demo and review. See `PLAN.md`.
 
-## 13. Open questions
+## 11. Open questions
 
-1. Final template set for the pilot (admission, tax notices, official summons?).
-2. Paper OCR vs. fully manual field entry for the first release.
-3. Registry governance model after the pilot.
-4. Whether to require `consume` semantics for specific letter types.
-5. Hosting and operator of the canonical verifier domain.
-6. How private (ZK) verification should handle revocation (see v2 caveat).
+1. Final slot layout for the demo template (suggested: ref, recipient_id, issue_date,
+   expiry_date, amount, category).
+2. Paper input: typed fields or OCR plus confirm.
+3. Whether to ship a verifier-challenge flow (verifier shows a nonce QR) or a free
+   `context` string for the demo.
+4. Pilot institution, or a fictional one for the showcase.
